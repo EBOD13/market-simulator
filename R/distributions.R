@@ -218,6 +218,20 @@ reconstruct_book <- function(dt, tick_size = 0.01, grid_interval_s = 1) {
     if (exists(key, envir = env, inherits = FALSE)) get(key, envir = env, inherits = FALSE) else 0
   }
 
+  # Sum of resting size across every price on one side, not just the touch.
+  # This must be the same depth measure book_depth() (R/price_model.R)
+  # reports during simulation, since theta is calibrated against whichever
+  # measure is captured here and then multiplied against book_depth()'s
+  # measure at generation time -- see the theta fix in event_generator.R.
+  level_total <- function(side) {
+    env <- if (side == "B") bid_levels else ask_levels
+    keys <- ls(env, all.names = TRUE)
+    if (length(keys) == 0) {
+      return(0)
+    }
+    sum(vapply(keys, function(k) get(k, envir = env, inherits = FALSE), numeric(1)))
+  }
+
   level_adjust <- function(side, p, delta) {
     env <- if (side == "B") bid_levels else ask_levels
     key <- price_key(p)
@@ -292,6 +306,8 @@ reconstruct_book <- function(dt, tick_size = 0.01, grid_interval_s = 1) {
   grid_best_ask <- numeric(n_grid_max)
   grid_bid_top_size <- numeric(n_grid_max)
   grid_ask_top_size <- numeric(n_grid_max)
+  grid_bid_total_size <- numeric(n_grid_max)
+  grid_ask_total_size <- numeric(n_grid_max)
   n_grid <- 0L
   next_grid_ts <- ts_ns[1]
 
@@ -303,6 +319,8 @@ reconstruct_book <- function(dt, tick_size = 0.01, grid_interval_s = 1) {
       grid_best_ask[n_grid] <- best_ask
       grid_bid_top_size[n_grid] <- if (is.na(best_bid)) NA_real_ else level_get("B", best_bid)
       grid_ask_top_size[n_grid] <- if (is.na(best_ask)) NA_real_ else level_get("S", best_ask)
+      grid_bid_total_size[n_grid] <- level_total("B")
+      grid_ask_total_size[n_grid] <- level_total("S")
       next_grid_ts <- next_grid_ts + grid_interval_ns
     }
 
@@ -462,7 +480,8 @@ reconstruct_book <- function(dt, tick_size = 0.01, grid_interval_s = 1) {
     state_grid = data.table::data.table(
       ts_ns = grid_ts_ns[idx_grid], best_bid = grid_best_bid[idx_grid],
       best_ask = grid_best_ask[idx_grid], bid_top_size = grid_bid_top_size[idx_grid],
-      ask_top_size = grid_ask_top_size[idx_grid]
+      ask_top_size = grid_ask_top_size[idx_grid],
+      bid_total_size = grid_bid_total_size[idx_grid], ask_total_size = grid_ask_total_size[idx_grid]
     ),
     n_add_no_two_sided_book = sum(msg %in% c("A", "F")) - n_add
   )
@@ -612,4 +631,94 @@ calibrate_distributions <- function(dt, tick_size = 0.01, alpha = 0.05, verbose 
   }
 
   result
+}
+
+# ---------------------------------------------------------------------------
+# Exponential-kernel Hawkes process: MLE fit against real event arrivals
+#
+#   lambda(t) = mu + sum_{t_i < t} alpha * exp(-beta * (t - t_i))
+#
+# Fit by maximum likelihood using Ozaki's (1979) O(n) recursive
+# log-likelihood for the exponential kernel -- no numerical integration is
+# needed, so this stays fast even at tens of thousands of events.
+#
+# Parameterized as (mu, branching_ratio = alpha/beta, beta) via a log/logit
+# transform, rather than (mu, alpha, beta) directly, so optim() searches an
+# unconstrained space while branching_ratio in (0, 1) is enforced
+# automatically. branching_ratio >= 1 is a non-stationary (explosive)
+# process -- never a legitimate fit for a real, finite market session -- and
+# is exactly the region an unconstrained (mu, alpha, beta) fit can wander
+# into and silently return as though it meant something.
+# ---------------------------------------------------------------------------
+
+hawkes_loglik <- function(par, event_times_s, T_obs_s) {
+  mu <- exp(par[1])
+  branching_ratio <- stats::plogis(par[2])
+  beta <- exp(par[3])
+  alpha <- branching_ratio * beta
+
+  n <- length(event_times_s)
+  if (n == 0) {
+    return(-mu * T_obs_s)
+  }
+
+  r <- numeric(n) # r[i] = sum_{t_j < t_i} exp(-beta * (t_i - t_j)), built recursively
+  if (n > 1) {
+    dt <- diff(event_times_s)
+    for (i in 2:n) {
+      r[i] <- exp(-beta * dt[i - 1]) * (1 + r[i - 1])
+    }
+  }
+
+  compensator <- (alpha / beta) * sum(1 - exp(-beta * (T_obs_s - event_times_s)))
+  sum(log(mu + alpha * r)) - mu * T_obs_s - compensator
+}
+
+#' Fits an exponential-kernel Hawkes process to real event arrival times by
+#' maximum likelihood, in place of assuming a branching ratio.
+#'
+#' @param event_times_s Arrival times in seconds from the start of the
+#'   observation window; sorted ascending internally if not already.
+#' @param T_obs_s Total observation window length, in seconds; must be >=
+#'   the last event time.
+#' @return A list with mu (baseline rate/s), alpha, beta (decay rate/s),
+#'   branching_ratio (alpha/beta), convergence diagnostics, and a note
+#'   describing the fit or, with too few events, explaining the fallback.
+fit_hawkes_exponential <- function(event_times_s, T_obs_s, decay_init_per_s = 1) {
+  event_times_s <- sort(event_times_s)
+  n <- length(event_times_s)
+
+  if (n < 20) {
+    return(list(
+      mu = NA_real_, alpha = NA_real_, beta = NA_real_, branching_ratio = NA_real_,
+      converged = FALSE,
+      note = sprintf("Only %d events -- too few to fit a Hawkes process; caller should fall back to an assumed branching ratio.", n)
+    ))
+  }
+
+  # Baseline guess at half the raw average rate; excitation is assumed to
+  # explain roughly the other half. Only a starting point for optim(), not
+  # a claim about the true split.
+  mu_init <- (n / T_obs_s) * 0.5
+  par0 <- c(log(mu_init), stats::qlogis(0.3), log(decay_init_per_s))
+
+  fit <- stats::optim(
+    par0, hawkes_loglik, event_times_s = event_times_s, T_obs_s = T_obs_s,
+    method = "Nelder-Mead", control = list(fnscale = -1, maxit = 2000)
+  )
+
+  mu <- exp(fit$par[1])
+  branching_ratio <- stats::plogis(fit$par[2])
+  beta <- exp(fit$par[3])
+  alpha <- branching_ratio * beta
+
+  list(
+    mu = mu, alpha = alpha, beta = beta, branching_ratio = branching_ratio,
+    loglik = fit$value, converged = fit$convergence == 0,
+    note = sprintf(
+      "Fit by MLE on %d real event arrivals over %.1fs: branching_ratio=%.3f, decay=%.3f/s (mean excitation lifetime %.2fs).%s",
+      n, T_obs_s, branching_ratio, beta, 1 / beta,
+      if (fit$convergence != 0) " optim() did not report convergence -- treat this fit with suspicion." else ""
+    )
+  )
 }

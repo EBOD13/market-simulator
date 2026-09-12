@@ -33,6 +33,16 @@
 library(data.table)
 library(bit64)
 
+# build_arrival_params() below calls fit_hawkes_exponential(), defined in
+# R/distributions.R. Sourced here, not left to whichever script happens to
+# source this file, so this module's own dependency is guaranteed regardless
+# of caller order -- source() of an already-loaded file is a harmless no-op
+# in R (function redefinitions, not side effects), so this is safe even when
+# a caller (scripts/analyze.R, scripts/benchmark.R) already sources it too.
+if (!exists("fit_hawkes_exponential")) {
+  source("R/distributions.R")
+}
+
 # ---------------------------------------------------------------------------
 # Calibration -> simulation parameters
 #
@@ -68,17 +78,35 @@ build_arrival_params <- function(calibration, tick_size = 0.01, n_levels = 15) {
   mu_buy <- sum(agg_events$aggressor_side == "BUY") / session_duration_s
   mu_sell <- sum(agg_events$aggressor_side == "SELL") / session_duration_s
 
+  # Hawkes self-excitation on market-order (aggressor) arrivals, fit by MLE
+  # against the real reconstructed aggressor timestamps (R/aggressors.R;
+  # fit_hawkes_exponential() in R/distributions.R) rather than assumed. Falls
+  # back to hawkes_market_fit$branching_ratio == NA when there are too few
+  # events to fit; simulate_market() is responsible for substituting its own
+  # assumed default in that case, since build_arrival_params() should not
+  # silently invent a number it cannot support.
+  aggressor_times_s <- as.numeric(agg_events$ts_ns - calibration$session_start_ns) / 1e9
+  hawkes_market_fit <- fit_hawkes_exponential(aggressor_times_s, session_duration_s)
+
   # theta: cancel rate per unit of resting depth (CSTT's depth-proportional
-  # cancellation). Approximated from the full-withdrawal (DELETE) rate over
-  # average TOP-OF-BOOK depth, since this pipeline's state_grid tracks only
-  # the touch, not the full book -- a real theta would use total book depth.
+  # cancellation), fit as the full-withdrawal (DELETE) rate over average
+  # TOTAL book depth (all levels, both sides summed per side) -- state_grid
+  # now carries bid_total_size/ask_total_size (R/distributions.R) precisely
+  # so this denominator matches book_depth()'s (R/price_model.R) TOTAL depth,
+  # which is what theta is actually multiplied against during simulation
+  # below (cancel_B/cancel_S). It was previously fit against top-of-book
+  # depth only and then applied against total depth -- since total depth is
+  # always >= top depth, that mismatch could only ever inflate the simulated
+  # cancel rate, never understate it, which is exactly the direction the
+  # observed bias ran.
   delete_rate <- dist$interarrival$DELETE$rate_hat_per_s
-  avg_top_depth <- mean(calibration$state_grid$bid_top_size + calibration$state_grid$ask_top_size, na.rm = TRUE)
-  theta <- delete_rate / avg_top_depth
+  avg_total_depth <- mean(calibration$state_grid$bid_total_size + calibration$state_grid$ask_total_size, na.rm = TRUE)
+  theta <- delete_rate / avg_total_depth
 
   list(
     n_levels = n_levels, tick_size = tick_size, session_duration_s = session_duration_s,
     lambda_i = lambda_i, mu_buy = mu_buy, mu_sell = mu_sell, theta = theta,
+    hawkes_market_fit = hawkes_market_fit,
     size_pool_limit = ao$shares, size_pool_market = agg_events$quantity
   )
 }
@@ -94,12 +122,43 @@ simulate_market <- function(calibration, duration_s, model = c("poisson", "hawke
                              tick_size = 0.01, n_levels = 15, initial_mid = 100,
                              bootstrap_levels = 10, bootstrap_depth = 300,
                              start_ts_ns = bit64::as.integer64(1), seed = NULL,
-                             hawkes_branching_ratio = 0.3, hawkes_decay_per_s = 1,
+                             hawkes_branching_ratio = NULL, hawkes_decay_per_s = NULL,
                              hawkes_cancel_excite_frac = 0.5) {
   model <- match.arg(model)
   if (!is.null(seed)) set.seed(seed)
 
   params <- build_arrival_params(calibration, tick_size = tick_size, n_levels = n_levels)
+
+  # hawkes_branching_ratio/hawkes_decay_per_s default to NULL, meaning "use
+  # what build_arrival_params() fit by MLE against real aggressor arrivals"
+  # (params$hawkes_market_fit; see fit_hawkes_exponential() in
+  # R/distributions.R) rather than an assumed constant. A caller can still
+  # pass either argument explicitly -- e.g. to A/B a hand-chosen value
+  # against the fitted one -- which overrides the fitted value for that run
+  # only. The fit can fail (too few aggressor events); that case, and only
+  # that case, falls back to a literal assumed default, with a warning that
+  # says so rather than silently pretending it was fit.
+  if (is.null(hawkes_branching_ratio)) {
+    fit <- params$hawkes_market_fit
+    if (!is.null(fit) && !is.na(fit$branching_ratio)) {
+      hawkes_branching_ratio <- fit$branching_ratio
+      if (model == "hawkes") message("Hawkes branching_ratio: ", fit$note)
+    } else {
+      hawkes_branching_ratio <- 0.3
+      if (model == "hawkes") {
+        warning("Hawkes MLE fit unavailable (", if (!is.null(fit)) fit$note else "no fit attempted",
+                "); falling back to an ASSUMED branching_ratio = 0.3.")
+      }
+    }
+  }
+  if (is.null(hawkes_decay_per_s)) {
+    fit <- params$hawkes_market_fit
+    if (!is.null(fit) && !is.na(fit$beta)) {
+      hawkes_decay_per_s <- fit$beta
+    } else {
+      hawkes_decay_per_s <- 1
+    }
+  }
 
   bb <- new_book(
     tick_size = tick_size, initial_mid = initial_mid, bootstrap_levels = bootstrap_levels,
