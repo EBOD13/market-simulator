@@ -30,17 +30,17 @@ flowchart LR
 
 ## Results at a glance
 
-The analysis replays real ITCH and synthetic data using identical book-reconstruction logic. Black is real data; red is synthetic data. The plots below are committed example outputs for the Poisson and Hawkes simulations calibrated to AAPL on Nasdaq BX, 2019-07-30.
+The analysis replays real ITCH and synthetic data using identical book-reconstruction logic. Black is real data; red is synthetic data. The plots below are committed example outputs for AAPL on Nasdaq BX, 2019-07-30; `scripts/analyze.R MSFT` and `INTC` write the equivalent `results/plots/MSFT_*`/`INTC_*` files, and the pattern across all three is the same one described in [Known limitations](#known-limitations) below.
 
 | Spread distribution | Depth near the touch |
 | --- | --- |
-| ![Poisson spread distribution compared with real market data](results/plots/poisson_spread.png) | ![Hawkes depth profile compared with real market data](results/plots/hawkes_depth_profile.png) |
+| ![Poisson spread distribution compared with real market data](results/plots/AAPL_poisson_spread.png) | ![Hawkes depth profile compared with real market data](results/plots/AAPL_hawkes_depth_profile.png) |
 | **Order lifetimes** | **Fill probability by queue position** |
-| ![Hawkes order lifetime ECDF compared with real market data](results/plots/hawkes_lifetime.png) | ![Hawkes fill probability by queue position compared with real market data](results/plots/hawkes_fill_probability.png) |
+| ![Hawkes order lifetime ECDF compared with real market data](results/plots/AAPL_hawkes_lifetime.png) | ![Hawkes fill probability by queue position compared with real market data](results/plots/AAPL_hawkes_fill_probability.png) |
 | **Poisson volatility clustering** | **Hawkes volatility clustering** |
-| ![Poisson absolute return autocorrelation](results/plots/poisson_volclustering_acf_synth.png) | ![Hawkes absolute return autocorrelation](results/plots/hawkes_volclustering_acf_synth.png) |
+| ![Poisson absolute return autocorrelation](results/plots/AAPL_poisson_volclustering_acf_synth.png) | ![Hawkes absolute return autocorrelation](results/plots/AAPL_hawkes_volclustering_acf_synth.png) |
 
-The Hawkes model is designed to capture clustered activity that a memoryless Poisson process cannot. Treat the figures as diagnostics, not a claim of universal fit: they depend on the selected symbol, venue, date, calibration, and simulation seed.
+The Hawkes model is designed to capture clustered activity that a memoryless Poisson process cannot; see [Known limitations](#known-limitations) for why these particular plots don't yet show it working. Treat all figures as diagnostics, not a claim of universal fit: they depend on the selected symbol, venue, date, calibration, and simulation seed.
 
 ## Requirements
 
@@ -68,17 +68,17 @@ workspace/
 
 ## Quick start
 
-From the repository root, once the calibration cache exists:
+From the repository root, once a calibration cache exists for the symbol you want (AAPL, MSFT, and INTC are bundled; see below to add more):
 
 ```bash
-Rscript scripts/simulate.R
+Rscript scripts/simulate.R AAPL
 ```
 
-This runs ten simulated minutes for both models with a fixed seed, validates their schema and book state, prints price diagnostics, and writes:
+Every script in `scripts/` takes the symbol as its first argument and defaults to `AAPL` if omitted. This runs ten simulated minutes for both models with a fixed seed, validates their schema and book state, prints price diagnostics, and writes:
 
 ```text
-data/processed/sim_events_poisson.csv
-data/processed/sim_events_hawkes.csv
+data/processed/sim_events_poisson_AAPL.csv
+data/processed/sim_events_hawkes_AAPL.csv
 ```
 
 To run every included test file:
@@ -99,23 +99,26 @@ scripts/fetch_itch.sh 20190730 bx
 
 This downloads the original compressed session, checks available disk space, verifies a published checksum when available, and decompresses it to `data/raw/itch/`. Full ITCH sessions are large—plan disk capacity accordingly.
 
-### 2. Decode one symbol with Leka
+### 2. Decode one or more symbols with Leka
 
-Use Leka's `tools/itch/itch_to_csv.cpp` on the decompressed session file and place the per-symbol CSV at:
+Use Leka's `tools/itch/itch_to_csv` on the decompressed session file. `--symbol` is repeatable, so decoding several symbols out of the same session file is one pass over it, not one per symbol:
 
-```text
-data/raw/20190730.BX.AAPL.csv
+```bash
+cd ../leka
+./build/itch_to_csv --input data/sample/20190730.BX_ITCH_50 \
+  --symbol AAPL --symbol MSFT --symbol INTC \
+  --output /tmp/multi_symbol_raw.csv
 ```
 
-The loader expects the column layout produced by Leka's decoder, including nanosecond timestamps and order references. For a different symbol, venue, or date, update the input and output paths in the scripts before running them.
+That produces one combined CSV with a `symbol` column; split it per symbol and place each at `data/raw/20190730.BX.<SYMBOL>.csv` in this repo (AAPL, MSFT, and INTC are already there). Adding a new symbol is just: decode it, drop the file at that path, and run steps 3-6 below with its ticker as the argument — nothing else in the pipeline is symbol-specific.
 
 ### 3. Build a reusable calibration cache
 
 ```bash
-Rscript scripts/build_calibration_cache.R
+Rscript scripts/build_calibration_cache.R AAPL
 ```
 
-The first pass reconstructs the real book and can take roughly five minutes for the bundled AAPL/BX configuration. It writes:
+The first pass per symbol reconstructs the real book and can take several minutes (roughly proportional to that symbol's row count: ~5 min for AAPL's ~192k rows, ~4 min for MSFT, ~1-2 min for INTC). It writes:
 
 ```text
 data/processed/calibration_AAPL_BX_20190730.rds
@@ -126,7 +129,7 @@ The cache preserves fitted distributions, recovered aggressor events, market-ord
 ### 4. Generate Poisson and Hawkes simulations
 
 ```bash
-Rscript scripts/simulate.R
+Rscript scripts/simulate.R AAPL
 ```
 
 Change `duration_s`, seed, and model settings in `scripts/simulate.R`, or call the simulation API directly:
@@ -142,23 +145,23 @@ validate_simulation(sim, calibration)
 write_interchange_csv(sim$events, "data/processed/my_hawkes_events.csv")
 ```
 
-`simulate_market()` supports `model = "poisson"` or `model = "hawkes"`. Hawkes parameters are fitted from recovered real aggressor timestamps when possible; the simulation reports when it must use its documented fallback.
+`simulate_market()` supports `model = "poisson"` or `model = "hawkes"`. Hawkes's branching ratio and decay rate are fit by maximum likelihood against that symbol's recovered real aggressor timestamps (see `fit_hawkes_exponential()` in `R/distributions.R`) whenever there are enough events; otherwise it falls back to an assumed value and says so via `warning()`.
 
 ### 5. Compare synthetic flow with real flow
 
 ```bash
-Rscript scripts/analyze.R
+Rscript scripts/analyze.R AAPL
 ```
 
-The analysis translates the real ITCH stream to the same interchange schema, replays real and synthetic streams through the same book engine, prints fit statistics, and writes plots to `results/plots/`.
+The analysis translates the real ITCH stream to the same interchange schema, replays real and synthetic streams through the same book engine, prints fit statistics, and writes plots to `results/plots/` tagged with the symbol and model (e.g. `AAPL_hawkes_spread.png`).
 
 ### 6. Benchmark the Leka matching engine (optional)
 
 ```bash
-Rscript scripts/benchmark.R
+Rscript scripts/benchmark.R AAPL
 ```
 
-The benchmark builds Leka's `benchmark_interchange` target if necessary and reports p50, p90, p99, p99.9, and maximum `MatchingEngine::processEvent()` latency by event category. Parsing is excluded from the measurement. It compares real, Poisson, and Hawkes event streams using identical C++ matching code.
+This is a real integration, not just a shared file format: the script writes the simulator's actual output through `write_interchange_csv()`, then shells out to Leka's compiled `benchmark_interchange` binary (built from `leka_core` if not already present), which parses the CSV, constructs a genuine `lob::OrderBook` and `lob::MatchingEngine`, and calls the real `processEvent()` on every row — the same C++ code path Leka runs in production. It reports p50, p90, p99, p99.9, and maximum latency by event category (parsing is excluded from the measurement) for the real, Poisson, and Hawkes event streams, and flags any category where real and synthetic latency diverge by more than 2x.
 
 ## Model design
 
@@ -233,10 +236,21 @@ tests/                  Standalone R regression tests
 results/plots/          Generated diagnostic charts
 ```
 
+## Known limitations
+
+Real-vs-synthetic comparison (`scripts/analyze.R`) is consistent across all three bundled symbols, which means these are genuine properties of the current model, not one-symbol noise:
+
+- **Spread and order-lifetime distributions diverge sharply** from real data (KS D routinely > 0.7, lifetime comparison at D=1.0 across every symbol). The lifetime number is partly a methodology artifact — real sessions run ~16 hours, synthetic runs are capped at 600s, so raw lifetime magnitudes aren't directly comparable yet — but the spread gap looks real.
+- **Volatility clustering is present in real data but nearly absent from both synthetic models.** The Hawkes branching ratio and decay are fit by real MLE now (not assumed), but that fit converges to a decay of several hundred per second — sub-millisecond excitation memory — on every symbol tested. That's a real property of how fast real trade bursts cluster, but it means the fitted Hawkes model is statistically indistinguishable from the Poisson baseline at the ~1-second resolution this analysis measures clustering at. Seeing the Hawkes effect would need comparing at millisecond resolution instead.
+- **Depth profile and fill-probability-by-queue-position match well** (normalized RMSE typically < 0.1) across all three symbols — these directly reflect calibrated inputs being reproduced correctly.
+- **Real return autocorrelation is robustly strongly negative** (-0.48 to -0.58 at lag 1 across AAPL/MSFT/INTC, consistent with bid-ask bounce) while synthetic is near zero in both models — a genuine, unresolved gap.
+
+In short: the pipeline is validated end-to-end (real bugs found and fixed by actually running data through it), and it's already useful for latency benchmarking against Leka, but it is not yet a statistically faithful synthetic-market generator.
+
 ## Important notes
 
 - This is a research and benchmarking simulator, not investment advice, an execution system, or a price forecast.
-- Calibration scripts are currently configured for **AAPL / Nasdaq BX / 2019-07-30**. Adjust hard-coded paths and output names consistently when changing the source data.
+- Bundled out of the box: AAPL, MSFT, and INTC on Nasdaq BX, 2019-07-30. Nothing in the pipeline is hard-coded to a specific symbol — every script takes the ticker as its first argument — so adding another is just decoding it (step 2) and running steps 3-6 with its ticker.
 - ITCH data availability, licensing, and usage terms are governed by Nasdaq. Confirm that your intended use complies with the applicable terms.
 - Synthetic output is reproducible when you keep the calibration, model settings, and seed fixed.
 
