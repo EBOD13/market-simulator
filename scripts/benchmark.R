@@ -11,10 +11,14 @@
 # repo's simulated book shape (depth-per-level, price range, event mix),
 # not about Leka: the same C++ code replays both.
 #
-# Run from the repo root: Rscript scripts/benchmark.R
+# Run from the repo root, one symbol at a time (default AAPL):
+#   Rscript scripts/benchmark.R AAPL
+#   Rscript scripts/benchmark.R MSFT
 # Requires: the Leka repo checked out as a sibling directory (override with
 # the LEKA_REPO_PATH env var), with benchmark_interchange built (this script
-# will (re)build it via cmake if missing).
+# will (re)build it via cmake if missing). Also requires
+# scripts/analyze.R <symbol> to have run first, for the cached real-data
+# interchange translation.
 
 suppressMessages({
   library(data.table)
@@ -27,6 +31,9 @@ source("R/distributions.R")
 source("R/aggressors.R")
 source("R/price_model.R")
 source("R/event_generator.R")
+
+args <- commandArgs(trailingOnly = TRUE)
+symbol <- if (length(args) >= 1) args[1] else "AAPL"
 
 leka_path <- Sys.getenv("LEKA_REPO_PATH", unset = normalizePath("../leka", mustWork = FALSE))
 if (!dir.exists(leka_path)) {
@@ -55,13 +62,13 @@ if (!file.exists(tool_path)) {
 # calibration and code, not a stale file).
 # ---------------------------------------------------------------------------
 
-itch_interchange_rds <- "data/processed/itch_interchange_AAPL_BX_20190730.rds"
-itch_interchange_csv <- "data/processed/itch_interchange_AAPL_BX_20190730.csv"
+itch_interchange_rds <- sprintf("data/processed/itch_interchange_%s_BX_20190730.rds", symbol)
+itch_interchange_csv <- sprintf("data/processed/itch_interchange_%s_BX_20190730.csv", symbol)
 
 if (!file.exists(itch_interchange_rds)) {
   stop(
     "No cached real-data interchange translation at ", itch_interchange_rds,
-    " -- run scripts/analyze.R first (it builds this as a side effect)."
+    " -- run: Rscript scripts/analyze.R ", symbol, " first (it builds this as a side effect)."
   )
 }
 if (!file.exists(itch_interchange_csv)) {
@@ -70,14 +77,16 @@ if (!file.exists(itch_interchange_csv)) {
   cat("Wrote", itch_interchange_csv, "\n")
 }
 
-calibration <- readRDS("data/processed/calibration_AAPL_BX_20190730.rds")
+calibration <- readRDS(sprintf("data/processed/calibration_%s_BX_20190730.rds", symbol))
 real_events_for_duration <- readRDS(itch_interchange_rds)
 duration_s <- as.numeric(max(real_events_for_duration$ts_ns) - min(real_events_for_duration$ts_ns)) / 1e9
 
+poisson_csv <- sprintf("data/processed/sim_events_poisson_%s.csv", symbol)
+hawkes_csv <- sprintf("data/processed/sim_events_hawkes_%s.csv", symbol)
 sim_p <- simulate_market(calibration, duration_s = min(duration_s, 600), model = "poisson", seed = 1)
 sim_h <- simulate_market(calibration, duration_s = min(duration_s, 600), model = "hawkes", seed = 1)
-write_interchange_csv(sim_p$events, "data/processed/sim_events_poisson.csv")
-write_interchange_csv(sim_h$events, "data/processed/sim_events_hawkes.csv")
+write_interchange_csv(sim_p$events, poisson_csv)
+write_interchange_csv(sim_h$events, hawkes_csv)
 
 # ---------------------------------------------------------------------------
 # Run the C++ benchmark against each CSV and parse its percentile report.
@@ -102,14 +111,14 @@ run_benchmark <- function(csv_path, tick = 100) {
   list(raw = out, table = data.table::rbindlist(parsed[!sapply(parsed, is.null)]))
 }
 
-cat("Running benchmark_interchange against real ITCH day...\n")
+cat("Running benchmark_interchange against real ITCH day (", symbol, ")...\n", sep = "")
 real_bench <- run_benchmark(itch_interchange_csv)
 cat("Running benchmark_interchange against synthetic (Poisson)...\n")
-poisson_bench <- run_benchmark("data/processed/sim_events_poisson.csv")
+poisson_bench <- run_benchmark(poisson_csv)
 cat("Running benchmark_interchange against synthetic (Hawkes)...\n")
-hawkes_bench <- run_benchmark("data/processed/sim_events_hawkes.csv")
+hawkes_bench <- run_benchmark(hawkes_csv)
 
-cat("\n=== Real ITCH day ===\n")
+cat("\n=== Real ITCH day (", symbol, ") ===\n", sep = "")
 print(real_bench$table)
 cat("\n=== Synthetic (Poisson) ===\n")
 print(poisson_bench$table)

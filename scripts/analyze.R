@@ -494,14 +494,21 @@ report <- function(results, model_label) {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Run from the repo root, one symbol at a time (default AAPL):
+#   Rscript scripts/analyze.R AAPL
+#   Rscript scripts/analyze.R MSFT
 
-itch_interchange_path <- "data/processed/itch_interchange_AAPL_BX_20190730.rds"
+args <- commandArgs(trailingOnly = TRUE)
+symbol <- if (length(args) >= 1) args[1] else "AAPL"
+
+itch_interchange_path <- sprintf("data/processed/itch_interchange_%s_BX_20190730.rds", symbol)
+itch_csv_path <- sprintf("data/raw/20190730.BX.%s.csv", symbol)
 
 if (file.exists(itch_interchange_path)) {
   real_events <- readRDS(itch_interchange_path)
-  cat("Loaded cached real-data interchange translation.\n")
+  cat("Loaded cached real-data interchange translation for", symbol, "\n")
 } else {
-  dt <- load_itch_csv("data/raw/20190730.BX.AAPL.csv")
+  dt <- load_itch_csv(itch_csv_path)
   book <- reconstruct_book(dt, tick_size = 0.01, grid_interval_s = 1)
   recovered <- recover_aggressors(book$executed_events)
   real_events <- translate_itch_to_interchange(dt, recovered$events)
@@ -511,7 +518,7 @@ if (file.exists(itch_interchange_path)) {
   cat("Translated and cached real-data interchange stream (", nrow(real_events), " rows).\n", sep = "")
 }
 
-calibration <- readRDS("data/processed/calibration_AAPL_BX_20190730.rds")
+calibration <- readRDS(sprintf("data/processed/calibration_%s_BX_20190730.rds", symbol))
 # The synthetic comparison doesn't need to match the real session's full
 # ~16-hour span -- these are distribution-shape comparisons (KS tests,
 # normalized profiles, ACF), which don't require equal sample sizes, and a
@@ -527,7 +534,8 @@ for (m in c("poisson", "hawkes")) {
   sim <- simulate_market(calibration, duration_s = synth_duration_s, model = m, seed = 1)
   synth_replay <- replay_interchange(sim$events, tick_size = 0.01)
   results <- compare_distributions(real_replay, synth_replay)
-  report(results, m)
-  plot_comparison(real_replay, synth_replay, results, "results/plots", m)
-  cat("Plots written to results/plots/", m, "_*.png\n", sep = "")
+  report(results, paste0(symbol, "/", m))
+  tag <- paste0(symbol, "_", m)
+  plot_comparison(real_replay, synth_replay, results, "results/plots", tag)
+  cat("Plots written to results/plots/", tag, "_*.png\n", sep = "")
 }

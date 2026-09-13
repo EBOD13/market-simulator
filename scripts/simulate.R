@@ -7,7 +7,9 @@
 # behaves differently from an exogenous random walk (which is generated only
 # for this comparison -- it is never fed into either simulation).
 #
-# Run from the repo root: Rscript scripts/simulate.R
+# Run from the repo root, one symbol at a time (default AAPL):
+#   Rscript scripts/simulate.R AAPL
+#   Rscript scripts/simulate.R MSFT
 
 suppressMessages({
   library(data.table)
@@ -18,9 +20,15 @@ source("R/types.R")
 source("R/price_model.R")
 source("R/event_generator.R")
 
-calibration_path <- "data/processed/calibration_AAPL_BX_20190730.rds"
+args <- commandArgs(trailingOnly = TRUE)
+symbol <- if (length(args) >= 1) args[1] else "AAPL"
+
+calibration_path <- sprintf("data/processed/calibration_%s_BX_20190730.rds", symbol)
 if (!file.exists(calibration_path)) {
-  stop("No cached calibration at ", calibration_path, " -- run scripts/build_calibration_cache.R first.")
+  stop(
+    "No cached calibration at ", calibration_path,
+    " -- run: Rscript scripts/build_calibration_cache.R ", symbol
+  )
 }
 calibration <- readRDS(calibration_path)
 cat("Calibration loaded:", calibration$symbol, calibration$venue, calibration$date, "\n")
@@ -80,7 +88,9 @@ ret_ref <- diff(ref$mid) / head(ref$mid, -1)
 acf_sq_ref <- stats::acf(ret_ref[is.finite(ret_ref)]^2, lag.max = 5, plot = FALSE)$acf[-1]
 cat("ACF of squared returns (lags 1-5), reference RW:", paste(round(acf_sq_ref, 3), collapse = ", "), "\n")
 
-# Emit to the interchange schema, one file per model.
-write_interchange_csv(sim_p$events, "data/processed/sim_events_poisson.csv")
-write_interchange_csv(sim_h$events, "data/processed/sim_events_hawkes.csv")
-cat("\nWrote data/processed/sim_events_poisson.csv and sim_events_hawkes.csv (schema-validated).\n")
+# Emit to the interchange schema, one file per model, one set per symbol.
+poisson_path <- sprintf("data/processed/sim_events_poisson_%s.csv", symbol)
+hawkes_path <- sprintf("data/processed/sim_events_hawkes_%s.csv", symbol)
+write_interchange_csv(sim_p$events, poisson_path)
+write_interchange_csv(sim_h$events, hawkes_path)
+cat("\nWrote", poisson_path, "and", hawkes_path, "(schema-validated).\n")
